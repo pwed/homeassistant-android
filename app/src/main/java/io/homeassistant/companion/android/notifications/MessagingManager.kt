@@ -1,6 +1,7 @@
 package io.homeassistant.companion.android.notifications
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
@@ -19,7 +20,10 @@ import android.media.MediaMetadataRetriever
 import android.media.RingtoneManager
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
+import android.net.ConnectivityManager
 import android.net.Uri
+import android.net.wifi.WifiConfiguration
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -35,6 +39,7 @@ import androidx.biometric.BiometricManager
 import androidx.car.app.notification.CarAppExtender
 import androidx.car.app.notification.CarNotificationManager
 import androidx.car.app.notification.CarPendingIntent
+import androidx.compose.ui.res.booleanResource
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.RemoteInput
@@ -47,7 +52,6 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.homeassistant.companion.android.R
 import io.homeassistant.companion.android.authenticator.Authenticator
-import io.homeassistant.companion.android.common.R as commonR
 import io.homeassistant.companion.android.common.data.prefs.PrefsRepository
 import io.homeassistant.companion.android.common.data.servers.ServerManager
 import io.homeassistant.companion.android.common.notifications.DeviceCommandData
@@ -82,13 +86,6 @@ import io.homeassistant.companion.android.util.UrlUtil
 import io.homeassistant.companion.android.vehicle.HaCarAppService
 import io.homeassistant.companion.android.websocket.WebsocketManager
 import io.homeassistant.companion.android.webview.WebViewActivity
-import java.io.File
-import java.net.URL
-import java.net.URLDecoder
-import java.time.Instant
-import java.time.LocalDateTime
-import java.time.ZoneId
-import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -102,6 +99,16 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okio.sink
 import org.json.JSONObject
+import java.io.File
+import java.lang.reflect.Method
+import java.net.URL
+import java.net.URLDecoder
+import java.time.Instant
+import java.time.LocalDateTime
+import java.time.ZoneId
+import javax.inject.Inject
+import io.homeassistant.companion.android.common.R as commonR
+
 
 class MessagingManager @Inject constructor(
     @ApplicationContext val context: Context,
@@ -158,6 +165,7 @@ class MessagingManager @Inject constructor(
         const val COMMAND_BROADCAST_INTENT = "command_broadcast_intent"
         const val COMMAND_VOLUME_LEVEL = "command_volume_level"
         const val COMMAND_BLUETOOTH = "command_bluetooth"
+        const val COMMAND_HOTSPOT = "command_hotspot"
         const val COMMAND_SCREEN_ON = "command_screen_on"
         const val COMMAND_MEDIA = "command_media"
         const val COMMAND_HIGH_ACCURACY_MODE = "command_high_accuracy_mode"
@@ -384,6 +392,21 @@ class MessagingManager @Inject constructor(
                             }
                         }
                         COMMAND_BLUETOOTH -> {
+                            if (
+                                !jsonData[NotificationData.COMMAND].isNullOrEmpty() &&
+                                jsonData[NotificationData.COMMAND] in DeviceCommandData.ENABLE_COMMANDS &&
+                                Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+                            ) {
+                                handleDeviceCommands(jsonData)
+                            } else {
+                                Log.d(
+                                    TAG,
+                                    "Invalid bluetooth command received, posting notification to device"
+                                )
+                                sendNotification(jsonData)
+                            }
+                        }
+                        COMMAND_HOTSPOT -> {
                             if (
                                 !jsonData[NotificationData.COMMAND].isNullOrEmpty() &&
                                 jsonData[NotificationData.COMMAND] in DeviceCommandData.ENABLE_COMMANDS &&
@@ -668,6 +691,40 @@ class MessagingManager @Inject constructor(
                     bluetoothAdapter?.disable()
                 } else if (command == DeviceCommandData.TURN_ON) {
                     bluetoothAdapter?.enable()
+                }
+            }
+            COMMAND_HOTSPOT -> {
+                val wifiManager: WifiManager = context.getSystemService()!!
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    when (PackageManager.PERMISSION_GRANTED) {
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_WIFI_STATE) -> {
+                            Log.d(TAG, "We have proper wifi permissions proceeding with command")
+                        }
+                        else -> {
+                            Log.e(TAG, "Missing wifi permissions, notifying user to grant permissions")
+                            notifyMissingPermission(message.toString(), serverId)
+                        }
+                    }
+                    when (PackageManager.PERMISSION_GRANTED) {
+                        ContextCompat.checkSelfPermission(context, Manifest.permission.CHANGE_WIFI_STATE) -> {
+                            Log.d(TAG, "We have proper wifi permissions proceeding with command")
+                        }
+                        else -> {
+                            Log.e(TAG, "Missing wifi permissions, notifying user to grant permissions")
+                            notifyMissingPermission(message.toString(), serverId)
+                        }
+                    }
+                }
+                @SuppressLint("PrivateApi")
+                val getWifiApConfiguration: Method = wifiManager.javaClass.getDeclaredMethod("getWifiApConfiguration")
+                val wifiApConfig: WifiConfiguration = getWifiApConfiguration.invoke(wifiManager) as WifiConfiguration
+                @SuppressLint("PrivateApi")
+                val setWifiApEnabled: Method = wifiManager.javaClass.getDeclaredMethod("setWifiApEnabled", WifiConfiguration::class.java, Boolean::class.java)
+                @Suppress("DEPRECATION")
+                if (command == DeviceCommandData.TURN_OFF) {
+                    setWifiApEnabled.invoke(wifiManager, wifiApConfig, true)
+                } else if (command == DeviceCommandData.TURN_ON) {
+                    setWifiApEnabled.invoke(wifiManager, wifiApConfig, false)
                 }
             }
             COMMAND_HIGH_ACCURACY_MODE -> {
